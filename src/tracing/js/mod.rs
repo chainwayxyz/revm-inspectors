@@ -416,7 +416,8 @@ where
 
         let (stack, _stack_guard) = StackRef::new(&interp.stack);
         let evm_memory = interp.memory.borrow();
-        let (memory, _memory_guard) = MemoryRef::new(&evm_memory);
+        let (memory, _memory_guard) = MemoryRef::new(evm_memory);
+        let active_call = self.active_call();
         let step = StepLog {
             stack,
             op: interp.bytecode.opcode().into(),
@@ -427,7 +428,12 @@ where
             depth: context.journal_ref().depth() as u64,
             refund: interp.control.gas().refunded() as u64,
             error: None,
-            contract: self.active_call().contract.clone(),
+            contract: Contract {
+                caller: interp.input.caller_address,
+                contract: interp.input.target_address,
+                value: active_call.contract.value,
+                input: active_call.contract.input.clone(),
+            },
         };
 
         if self.try_step(step, db).is_err() {
@@ -446,7 +452,8 @@ where
 
             let (stack, _stack_guard) = StackRef::new(&interp.stack);
             let mem = interp.memory.borrow();
-            let (memory, _memory_guard) = MemoryRef::new(&mem);
+            let (memory, _memory_guard) = MemoryRef::new(mem);
+            let active_call = self.active_call();
             let step = StepLog {
                 stack,
                 op: interp.bytecode.opcode().into(),
@@ -457,7 +464,12 @@ where
                 depth: context.journal_ref().depth() as u64,
                 refund: interp.control.gas().refunded() as u64,
                 error: Some(format!("{:?}", interp.control.instruction_result())),
-                contract: self.active_call().contract.clone(),
+                contract: Contract {
+                    caller: interp.input.caller_address,
+                    contract: interp.input.target_address,
+                    value: active_call.contract.value,
+                    input: active_call.contract.input.clone(),
+                },
             };
 
             let _ = self.try_fault(step, db);
@@ -469,10 +481,12 @@ where
     fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         self.register_precompiles(context);
 
-        // determine contract address based on the call scheme
-        let contract = match inputs.scheme {
-            CallScheme::DelegateCall | CallScheme::CallCode => inputs.target_address,
-            _ => inputs.bytecode_address,
+        // determine contract and caller based on the call scheme
+        let (caller, contract) = match inputs.scheme {
+            CallScheme::DelegateCall | CallScheme::CallCode => {
+                (inputs.target_address, inputs.bytecode_address)
+            }
+            _ => (inputs.caller, inputs.target_address),
         };
 
         let value = inputs.transfer_value().unwrap_or_default();
@@ -481,7 +495,7 @@ where
             inputs.input.clone(),
             value,
             inputs.scheme.into(),
-            inputs.caller,
+            caller,
             inputs.gas_limit,
         );
 
