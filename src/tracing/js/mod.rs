@@ -85,6 +85,8 @@ pub struct JsInspector {
     call_stack: Vec<CallStackItem>,
     /// Marker to track whether the precompiles have been registered.
     precompiles_registered: bool,
+    /// Tracker for when a revert is triggered manually (e.g. failing step hook)
+    force_revert_pc: Option<usize>,
 }
 
 impl JsInspector {
@@ -190,6 +192,7 @@ impl JsInspector {
             step_fn,
             call_stack: Default::default(),
             precompiles_registered: false,
+            force_revert_pc: None,
         })
     }
 
@@ -439,6 +442,9 @@ where
 
         if self.try_step(step, db).is_err() {
             interp.control.set_instruction_result(InstructionResult::Revert);
+            // we must record the current PC before we manually trigger an revert that we then need
+            // to handle in the step_end call that follows
+            self.force_revert_pc = Some(interp.bytecode.pc());
         }
     }
 
@@ -459,8 +465,9 @@ where
                 stack,
                 // we can use REVERT opcode here because we checked that this was a revert
                 op: OpCode::REVERT.get().into(),
+                // Because this revert was triggered manually we must use the recorded pc
+                pc: self.force_revert_pc.unwrap_or_else(|| interp.bytecode.pc()) as u64,
                 memory,
-                pc: interp.bytecode.pc() as u64,
                 gas_remaining: interp.control.gas().remaining(),
                 cost: interp.control.gas().spent(),
                 depth: context.journal_ref().depth() as u64,
