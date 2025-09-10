@@ -1,6 +1,9 @@
 use alloc::{vec, vec::Vec};
 use alloy_primitives::{map::DefaultHashBuilder, Address, U256};
-use core::hash::{BuildHasher, Hash, Hasher};
+use core::{
+    fmt,
+    hash::{BuildHasher, Hash, Hasher},
+};
 use revm::{
     bytecode::opcode::{self},
     interpreter::{
