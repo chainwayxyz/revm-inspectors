@@ -601,9 +601,6 @@ pub enum DecodedTraceStep {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CallTraceStep {
-    // Fields filled in `step`
-    /// Call depth
-    pub depth: u64,
     /// Program counter before step execution
     pub pc: usize,
     /// Code section index before step execution
@@ -650,9 +647,13 @@ impl CallTraceStep {
     /// Converts this step into a geth [StructLog]
     ///
     /// This sets memory and stack capture based on the `opts` parameter.
-    pub(crate) fn convert_to_geth_struct_log(&self, opts: &GethDefaultTracingOptions) -> StructLog {
+    pub(crate) fn convert_to_geth_struct_log(
+        &self,
+        opts: &GethDefaultTracingOptions,
+        depth: u64,
+    ) -> StructLog {
         let mut log = StructLog {
-            depth: self.depth,
+            depth,
             error: self.as_error(),
             gas: self.gas_remaining,
             gas_cost: self.gas_cost,

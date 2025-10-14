@@ -438,7 +438,6 @@ impl TracingInspector {
         }
 
         trace.trace.steps.push(CallTraceStep {
-            depth: context.journal().depth() as u64,
             pc: interp.bytecode.pc(),
             code_section_idx: interp.sub_routine.routine_idx(),
             op,
