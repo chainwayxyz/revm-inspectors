@@ -1,6 +1,6 @@
 //! Geth tests
 use crate::utils::deploy_contract;
-use alloy_primitives::{hex, map::HashMap, Address, Bytes};
+use alloy_primitives::{hex, map::HashMap, Address, Bytes, TxKind};
 use alloy_rpc_types_eth::TransactionInfo;
 use alloy_rpc_types_trace::geth::{
     mux::MuxConfig, CallConfig, FlatCallConfig, GethDebugBuiltInTracerType, GethDebugTracerConfig,
@@ -657,16 +657,15 @@ fn test_geth_calltracer_null_bytes_revert_reason_omitted() {
     let mut evm = evm.with_inspector(&mut insp);
 
     // Call function that reverts with null bytes
-    let res = evm
-        .inspect_tx(TxEnv {
-            caller: deployer,
-            kind: TxKind::Call(addr),
-            data: hex!("3bc5de30").into(), // call function selector
-            gas_limit: 1_000_000,
-            nonce: 1, // Set correct nonce after contract deployment
-            ..Default::default()
-        })
-        .unwrap();
+    evm.set_tx(TxEnv {
+        caller: deployer,
+        kind: TxKind::Call(addr),
+        data: hex!("3bc5de30").into(), // call function selector
+        gas_limit: 1_000_000,
+        nonce: 1, // Set correct nonce after contract deployment
+        ..Default::default()
+    });
+    let res = evm.inspect_replay().unwrap();
 
     let call_config = CallConfig::default();
     let call_frame = insp.geth_builder().geth_call_traces(call_config, res.result.gas_used());
