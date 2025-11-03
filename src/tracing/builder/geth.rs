@@ -304,7 +304,6 @@ impl<'a> GethTraceBuilder<'a> {
             }
 
             state_diff.pre.insert(addr, pre_state);
-            state_diff.post.insert(addr, post_state);
 
             // determine the change type
             let pre_change = if changed_acc.is_created() {
@@ -319,6 +318,11 @@ impl<'a> GethTraceBuilder<'a> {
             };
 
             account_change_kinds.insert(addr, (pre_change, post_change));
+
+            // Don't insert selfdestructed accounts into post state
+            if !changed_acc.is_selfdestructed() {
+                state_diff.post.insert(addr, post_state);
+            }
         }
 
         // ensure we're only keeping changed entries
