@@ -15,7 +15,8 @@ use alloy_rpc_types_trace::geth::{
 };
 use revm::{
     context_interface::result::{HaltReasonTr, ResultAndState},
-    state::EvmState,
+    primitives::KECCAK_EMPTY,
+    state::{AccountInfo, EvmState},
     DatabaseRef,
 };
 
@@ -306,7 +307,11 @@ impl<'a> GethTraceBuilder<'a> {
             state_diff.pre.insert(addr, pre_state);
 
             // determine the change type
-            let pre_change = if changed_acc.is_created() {
+            // if the account was created _and_ not empty we need to treat it as modified,
+            // so that it is retained later in `diff_traces`
+            // See <https://etherscan.io/tx/0x391f4b6a382d3bcc3120adc2ea8c62003e604e487d97281129156fd284a1a89d>
+            // <https://github.com/paradigmxyz/reth/issues/19703#issuecomment-3527067849>
+            let pre_change = if changed_acc.is_created() && account_was_empty(&db_acc) {
                 AccountChangeKind::Create
             } else {
                 AccountChangeKind::Modify
@@ -358,5 +363,62 @@ impl<'a> GethTraceBuilder<'a> {
             // only keep accounts that are not created
             change_type.get(addr).map(|ty| !ty.0.is_created()).unwrap_or(true)
         });
+    }
+}
+
+fn account_was_empty(account: &AccountInfo) -> bool {
+    account.balance.is_zero() && account.nonce == 0 && account.code_hash == KECCAK_EMPTY
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{address, U256};
+    use revm::{
+        database::CacheDB,
+        database_interface::EmptyDB,
+        state::{Account, AccountInfo},
+    };
+
+    #[test]
+    fn prestate_diff_keeps_prefunded_created_accounts() {
+        let mut state = EvmState::default();
+        let prefunded_addr = address!("1000000000000000000000000000000000000001");
+        let empty_addr = address!("2000000000000000000000000000000000000002");
+
+        let mut prefunded_account = Account::default();
+        prefunded_account.mark_created();
+        prefunded_account.info.balance = U256::from(1);
+        prefunded_account.info.nonce = 1;
+        state.insert(prefunded_addr, prefunded_account);
+
+        let mut empty_account = Account::default();
+        empty_account.mark_created();
+        empty_account.info.nonce = 1;
+        state.insert(empty_addr, empty_account);
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            prefunded_addr,
+            AccountInfo { balance: U256::from(10), ..Default::default() },
+        );
+
+        let builder = GethTraceBuilder::new(Vec::new());
+        let frame =
+            builder.geth_prestate_diff_traces(&state, db, false, false).expect("diff frame");
+
+        match frame {
+            PreStateFrame::Diff(diff) => {
+                assert!(
+                    diff.pre.contains_key(&prefunded_addr),
+                    "prefunded contract must remain in prestate diff"
+                );
+                assert!(
+                    !diff.pre.contains_key(&empty_addr),
+                    "contracts created on empty addresses are still filtered out"
+                );
+            }
+            _ => panic!("expected diff prestate frame"),
+        }
     }
 }
