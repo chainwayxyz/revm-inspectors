@@ -20,7 +20,7 @@ use alloy_primitives::{Address, Bytes, Log, U256};
 pub use boa_engine::vm::RuntimeLimits;
 use boa_engine::{js_string, Context, JsError, JsObject, JsResult, JsValue, Source};
 use revm::{
-    bytecode::OpCode,
+    bytecode::opcode::OpCode,
     context::JournalTr,
     context_interface::{
         result::{ExecutionResult, HaltReasonTr, Output, ResultAndState},
@@ -424,7 +424,7 @@ where
 
         let (stack, _stack_guard) = StackRef::new(&interp.stack);
         let evm_memory = interp.memory.borrow();
-        let (memory, _memory_guard) = MemoryRef::new(evm_memory);
+        let (memory, _memory_guard) = MemoryRef::new(&evm_memory);
         let active_call = self.active_call();
         let step = StepLog {
             stack,
@@ -460,7 +460,7 @@ where
 
             let (stack, _stack_guard) = StackRef::new(&interp.stack);
             let mem = interp.memory.borrow();
-            let (memory, _memory_guard) = MemoryRef::new(mem);
+            let (memory, _memory_guard) = MemoryRef::new(&mem);
             let active_call = self.active_call();
             let step = StepLog {
                 stack,
