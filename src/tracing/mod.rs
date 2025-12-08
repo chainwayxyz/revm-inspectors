@@ -376,7 +376,7 @@ impl TracingInspector {
     /// This expects an existing [CallTrace], in other words, this panics if not within the context
     /// of a call.
     #[cold]
-    fn start_step<CTX: ContextTr>(&mut self, interp: &mut Interpreter, context: &mut CTX) {
+    fn start_step<CTX: ContextTr>(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
         let trace_idx = self.last_trace_idx();
         let trace = &mut self.traces.arena[trace_idx];
 
