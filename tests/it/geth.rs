@@ -742,16 +742,16 @@ fn test_geth_prestate_diff_selfdestruct(spec_id: SpecId) {
     let db = evm.ctx().db().clone();
     let mut evm = evm.with_inspector(insp);
 
-    let res = evm
-        .inspect_tx(TxEnv {
-            caller: deployer,
-            gas_limit: 1000000,
-            kind: TransactTo::Call(addr),
-            data: hex!("43d726d6").into(),
-            nonce: 1,
-            ..Default::default()
-        })
-        .unwrap();
+    evm.set_tx(TxEnv {
+        caller: deployer,
+        gas_limit: 1000000,
+        kind: TransactTo::Call(addr),
+        data: hex!("43d726d6").into(),
+        nonce: 1,
+        ..Default::default()
+    });
+
+    let res = evm.inspect_replay().unwrap();
 
     assert!(res.result.is_success(), "{res:#?}");
 
