@@ -129,7 +129,6 @@ where
         let opcode = match inputs.scheme {
             CreateScheme::Create => opcode::CREATE,
             CreateScheme::Create2 { .. } => opcode::CREATE2,
-            CreateScheme::Custom { .. } => return None,
         };
 
         self.subtract_gas_limit(opcode, inputs.gas_limit);
