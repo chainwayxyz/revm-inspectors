@@ -170,7 +170,6 @@ impl<'a> GethTraceBuilder<'a> {
 
             // selfdestructs are not recorded as individual call traces but are derived from
             // the call trace and are added as additional `CallFrame` objects
-            // becoming the first child of the derived call
             if let Some(selfdestruct) = trace.geth_selfdestruct_call_trace() {
                 call_frames.last_mut().expect("not empty").1.calls.push(selfdestruct);
             }
@@ -180,14 +179,21 @@ impl<'a> GethTraceBuilder<'a> {
         // this will roll up the child frames to their parent; this works because `child idx >
         // parent idx`
         loop {
-            let (idx, call) = call_frames.pop().expect("call frames not empty");
+            let (idx, mut call) = call_frames.pop().expect("call frames not empty");
             let node = &self.nodes[idx];
+
+            // Children are appended as they are popped, which is highest index first, so they end
+            // up in reverse call order behind the selfdestruct frame that was pushed on
+            // construction; reversing here restores the call order and leaves the selfdestruct
+            // last, which is where inserting each child at the front used to leave it.
+            //
+            // Appending and reversing once is what keeps this linear: inserting every child at the
+            // front makes assembling a frame with `n` children `O(n^2)` moves of a `CallFrame`,
+            // which is enough to hang the tracer for minutes on a call heavy transaction.
+            call.calls.reverse();
+
             if let Some(parent) = node.parent {
-                let parent_frame = &mut call_frames[parent];
-                // we need to ensure that calls are in order they are called: the last child node is
-                // the last call, but since we walk up the tree, we need to always
-                // insert at position 0
-                parent_frame.1.calls.insert(0, call);
+                call_frames[parent].1.calls.push(call);
             } else {
                 debug_assert!(call_frames.is_empty(), "only one root node has no parent");
                 return call;
