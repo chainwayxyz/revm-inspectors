@@ -1,4 +1,6 @@
-use crate::tracing::{FourByteInspector, TracingInspector, TracingInspectorConfig};
+use crate::tracing::{
+    geth::PrestateError, FourByteInspector, TracingInspector, TracingInspectorConfig,
+};
 use alloc::vec::Vec;
 use alloy_primitives::{map::HashMap, Address, Log, U256};
 use alloy_rpc_types_eth::TransactionInfo;
@@ -107,6 +109,22 @@ impl MuxInspector {
         db: &DB,
         tx_info: TransactionInfo,
     ) -> Result<MuxFrame, DB::Error> {
+        self.try_into_mux_frame_with_size_limit(result, db, tx_info, None).map_err(|e| match e {
+            PrestateError::Database(e) => e,
+            // `None` above disables the size check, so this variant is never produced.
+            PrestateError::MaxResponseSize { .. } => unreachable!("no size limit was set"),
+        })
+    }
+
+    /// Like [`Self::try_into_mux_frame`], but bounds the bytes a prestate sub-trace may retain; see
+    /// [`GethTraceBuilder::geth_prestate_traces_with_size_limit`](crate::tracing::geth::GethTraceBuilder::geth_prestate_traces_with_size_limit).
+    pub fn try_into_mux_frame_with_size_limit<DB: DatabaseRef>(
+        &self,
+        result: &ResultAndState<impl HaltReasonTr>,
+        db: &DB,
+        tx_info: TransactionInfo,
+        max_size: Option<usize>,
+    ) -> Result<MuxFrame, PrestateError<DB::Error>> {
         let mut frame = HashMap::with_capacity_and_hasher(self.configs.len(), Default::default());
 
         for (tracer_type, config) in &self.configs {
@@ -125,7 +143,12 @@ impl MuxInspector {
                     if let Some(inspector) = &self.tracing {
                         inspector
                             .geth_builder()
-                            .geth_prestate_traces(result, prestate_config, db)?
+                            .geth_prestate_traces_with_size_limit(
+                                result,
+                                prestate_config,
+                                db,
+                                max_size,
+                            )?
                             .into()
                     } else {
                         continue;
