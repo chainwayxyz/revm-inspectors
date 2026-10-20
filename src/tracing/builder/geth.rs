@@ -229,16 +229,39 @@ impl<'a> GethTraceBuilder<'a> {
     /// * `db` - The database to fetch state pre-transaction execution.
     pub fn geth_prestate_traces<DB: DatabaseRef>(
         &self,
-        ResultAndState { state, .. }: &ResultAndState<impl HaltReasonTr>,
+        result: &ResultAndState<impl HaltReasonTr>,
         prestate_config: &PreStateConfig,
         db: DB,
     ) -> Result<PreStateFrame, DB::Error> {
+        self.geth_prestate_traces_with_size_limit(result, prestate_config, db, None).map_err(|e| {
+            match e {
+                PrestateError::Database(e) => e,
+                // `None` above disables the size check, so this variant is never produced.
+                PrestateError::MaxResponseSize { .. } => unreachable!("no size limit was set"),
+            }
+        })
+    }
+
+    /// Like [`Self::geth_prestate_traces`], but bounds the bytes the returned frame may retain.
+    ///
+    /// The frame is built from post-execution state after tracing, so a memory budget enforced over
+    /// a tracer's recorded steps does not cover it. When `max_size` is set, building stops with
+    /// [`PrestateError::MaxResponseSize`] once the frame would grow past it, keeping the retained
+    /// size bounded regardless of how many accounts the transaction touched. See
+    /// [`account_state_size`] for the estimate.
+    pub fn geth_prestate_traces_with_size_limit<DB: DatabaseRef>(
+        &self,
+        ResultAndState { state, .. }: &ResultAndState<impl HaltReasonTr>,
+        prestate_config: &PreStateConfig,
+        db: DB,
+        max_size: Option<usize>,
+    ) -> Result<PreStateFrame, PrestateError<DB::Error>> {
         let code_enabled = prestate_config.code_enabled();
         let storage_enabled = prestate_config.storage_enabled();
         if prestate_config.is_diff_mode() {
-            self.geth_prestate_diff_traces(state, db, code_enabled, storage_enabled)
+            self.geth_prestate_diff_traces(state, db, code_enabled, storage_enabled, max_size)
         } else {
-            self.geth_prestate_pre_traces(state, db, code_enabled, storage_enabled)
+            self.geth_prestate_pre_traces(state, db, code_enabled, storage_enabled, max_size)
         }
     }
 
@@ -248,13 +271,15 @@ impl<'a> GethTraceBuilder<'a> {
         db: DB,
         code_enabled: bool,
         storage_enabled: bool,
-    ) -> Result<PreStateFrame, DB::Error> {
+        max_size: Option<usize>,
+    ) -> Result<PreStateFrame, PrestateError<DB::Error>> {
         let account_diffs = state.iter().map(|(addr, acc)| (*addr, acc));
         let mut prestate = PreStateMode::default();
+        let mut size = 0usize;
 
         // we only want changed accounts for things like balance changes etc
         for (addr, changed_acc) in account_diffs {
-            let db_acc = db.basic_ref(addr)?.unwrap_or_default();
+            let db_acc = db.basic_ref(addr).map_err(PrestateError::Database)?.unwrap_or_default();
             let code = code_enabled.then(|| load_account_code(&db, &db_acc)).flatten();
             let mut acc_state = AccountState::from_account_info(db_acc.nonce, db_acc.balance, code);
 
@@ -263,6 +288,13 @@ impl<'a> GethTraceBuilder<'a> {
                 for (key, slot) in changed_acc.storage.iter() {
                     acc_state.storage.insert((*key).into(), slot.original_value.into());
                 }
+            }
+
+            // Abort before the map grows past the budget; the overshoot is bounded by the one
+            // account in flight (<= 24 KiB of code under EIP-170).
+            size += account_state_size(&acc_state);
+            if let Some(limit) = max_size.filter(|limit| size > *limit) {
+                return Err(PrestateError::MaxResponseSize { limit });
             }
 
             prestate.0.insert(addr, acc_state);
@@ -277,13 +309,15 @@ impl<'a> GethTraceBuilder<'a> {
         db: DB,
         code_enabled: bool,
         storage_enabled: bool,
-    ) -> Result<PreStateFrame, DB::Error> {
+        max_size: Option<usize>,
+    ) -> Result<PreStateFrame, PrestateError<DB::Error>> {
         let account_diffs = state.iter().map(|(addr, acc)| (*addr, acc));
         let mut state_diff = DiffMode::default();
+        let mut size = 0usize;
         let mut account_change_kinds =
             HashMap::with_capacity_and_hasher(account_diffs.len(), Default::default());
         for (addr, changed_acc) in account_diffs {
-            let db_acc = db.basic_ref(addr)?.unwrap_or_default();
+            let db_acc = db.basic_ref(addr).map_err(PrestateError::Database)?.unwrap_or_default();
 
             let pre_code = code_enabled.then(|| load_account_code(&db, &db_acc)).flatten();
 
@@ -308,6 +342,13 @@ impl<'a> GethTraceBuilder<'a> {
                     pre_state.storage.insert((*key).into(), slot.original_value.into());
                     post_state.storage.insert((*key).into(), slot.present_value.into());
                 }
+            }
+
+            // Charge both halves before inserting; `retain_changed`/`diff_traces` below only prune,
+            // so this bounds the final frame conservatively. Overshoot is one account's pre-code.
+            size += account_state_size(&pre_state) + account_state_size(&post_state);
+            if let Some(limit) = max_size.filter(|limit| size > *limit) {
+                return Err(PrestateError::MaxResponseSize { limit });
             }
 
             state_diff.pre.insert(addr, pre_state);
@@ -376,6 +417,30 @@ fn account_was_empty(account: &AccountInfo) -> bool {
     account.balance.is_zero() && account.nonce == 0 && account.code_hash == KECCAK_EMPTY
 }
 
+/// Approximate bytes an [`AccountState`] retains in a prestate frame: the record itself, its code,
+/// and 64 bytes (key + value) per storage slot. An estimate for budgeting, not an exact heap
+/// measurement; code dominates, up to 24 KiB per account under EIP-170.
+fn account_state_size(acc: &AccountState) -> usize {
+    core::mem::size_of::<AccountState>()
+        + acc.code.as_ref().map_or(0, |code| code.len())
+        + acc.storage.len() * (2 * core::mem::size_of::<B256>())
+}
+
+/// Error returned while building a geth prestate trace under a response size budget.
+#[derive(Debug, thiserror::Error)]
+pub enum PrestateError<E> {
+    /// A database error occurred while fetching pre-transaction state.
+    #[error(transparent)]
+    Database(E),
+    /// Building the prestate response would retain more than `limit` bytes; building was aborted
+    /// before the full response was materialized.
+    #[error("prestate response exceeded the memory limit of {limit} bytes")]
+    MaxResponseSize {
+        /// The configured byte budget that was exceeded.
+        limit: usize,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,7 +476,7 @@ mod tests {
 
         let builder = GethTraceBuilder::new(Vec::new());
         let frame =
-            builder.geth_prestate_diff_traces(&state, db, false, false).expect("diff frame");
+            builder.geth_prestate_diff_traces(&state, db, false, false, None).expect("diff frame");
 
         match frame {
             PreStateFrame::Diff(diff) => {
