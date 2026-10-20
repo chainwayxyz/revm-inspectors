@@ -102,6 +102,13 @@ impl MuxInspector {
         Ok(MuxInspector { four_byte, tracing, configs })
     }
 
+    /// The configuration of the inner tracing inspector: the union of what every muxed tracer
+    /// records. Returns [`None`] when the mux holds only tracers that run without one (the four
+    /// byte and noop tracers). Lets a caller size a budget from what the mux actually retains.
+    pub fn tracing_config(&self) -> Option<&TracingInspectorConfig> {
+        self.tracing.as_ref().map(TracingInspector::config)
+    }
+
     /// Try converting this [MuxInspector] into a [MuxFrame].
     pub fn try_into_mux_frame<DB: DatabaseRef>(
         &self,
