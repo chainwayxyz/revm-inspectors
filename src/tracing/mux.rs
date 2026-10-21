@@ -116,23 +116,29 @@ impl MuxInspector {
         db: &DB,
         tx_info: TransactionInfo,
     ) -> Result<MuxFrame, DB::Error> {
-        self.try_into_mux_frame_with_size_limit(result, db, tx_info, None).map_err(|e| match e {
-            PrestateError::Database(e) => e,
-            // `None` above disables the size check, so this variant is never produced.
-            PrestateError::MaxResponseSize { .. } => unreachable!("no size limit was set"),
-        })
+        self.try_into_mux_frame_with_size_limit(result, db, tx_info, None)
+            .map(|(frame, _size)| frame)
+            .map_err(|e| match e {
+                PrestateError::Database(e) => e,
+                // `None` above disables the size check, so this variant is never produced.
+                PrestateError::MaxResponseSize { .. } => unreachable!("no size limit was set"),
+            })
     }
 
-    /// Like [`Self::try_into_mux_frame`], but bounds the bytes a prestate sub-trace may retain; see
+    /// Like [`Self::try_into_mux_frame`], but bounds the bytes a prestate sub-trace may retain and
+    /// reports how many it did; see
     /// [`GethTraceBuilder::geth_prestate_traces_with_size_limit`](crate::tracing::geth::GethTraceBuilder::geth_prestate_traces_with_size_limit).
+    /// A mux holds at most one prestate tracer, so the count is that sub-trace's retained size (or
+    /// zero), which a caller can charge against a budget shared across a block's transactions.
     pub fn try_into_mux_frame_with_size_limit<DB: DatabaseRef>(
         &self,
         result: &ResultAndState<impl HaltReasonTr>,
         db: &DB,
         tx_info: TransactionInfo,
         max_size: Option<usize>,
-    ) -> Result<MuxFrame, PrestateError<DB::Error>> {
+    ) -> Result<(MuxFrame, usize), PrestateError<DB::Error>> {
         let mut frame = HashMap::with_capacity_and_hasher(self.configs.len(), Default::default());
+        let mut prestate_size = 0usize;
 
         for (tracer_type, config) in &self.configs {
             let trace = match config {
@@ -148,15 +154,16 @@ impl MuxInspector {
                 }
                 TraceConfig::PreState(prestate_config) => {
                     if let Some(inspector) = &self.tracing {
-                        inspector
+                        let (prestate_frame, size) = inspector
                             .geth_builder()
                             .geth_prestate_traces_with_size_limit(
                                 result,
                                 prestate_config,
                                 db,
                                 max_size,
-                            )?
-                            .into()
+                            )?;
+                        prestate_size += size;
+                        prestate_frame.into()
                     } else {
                         continue;
                     }
@@ -186,7 +193,7 @@ impl MuxInspector {
             );
         }
 
-        Ok(MuxFrame(frame))
+        Ok((MuxFrame(frame), prestate_size))
     }
 }
 

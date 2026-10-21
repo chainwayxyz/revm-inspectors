@@ -795,3 +795,92 @@ fn test_geth_prestate_diff_selfdestruct(spec_id: SpecId) {
         _ => panic!("Expected Diff mode PreStateFrame"),
     }
 }
+
+/// A diff-mode prestate that touches a large-code contract without changing it must be charged for
+/// the *pruned* diff, not the full pre/post state built before pruning. Calling a contract whose
+/// runtime is all `STOP` changes no state, so `retain_changed` drops it (and its code) from both
+/// sides, leaving only the caller's gas/nonce change. A size limit far below that code must still
+/// admit the request, and the reported size must be the small pruned diff.
+#[test]
+fn test_geth_prestate_diff_size_limit_charges_pruned_diff() {
+    // init code returning a 2000-byte all-`STOP` runtime:
+    // PUSH2 len; DUP1; PUSH1 12; PUSH1 0; CODECOPY; PUSH1 0; RETURN; <runtime>
+    let runtime = vec![0u8; 2000];
+    let mut code = vec![
+        0x61,
+        (runtime.len() >> 8) as u8,
+        runtime.len() as u8,
+        0x80,
+        0x60,
+        0x0c,
+        0x60,
+        0x00,
+        0x39,
+        0x60,
+        0x00,
+        0xf3,
+    ];
+    code.extend_from_slice(&runtime);
+
+    let caller = alloy_primitives::address!("341348115259a8bf69f1f50101c227fced83bac6");
+
+    let context = Context::mainnet()
+        .with_db(CacheDB::<EmptyDB>::default())
+        .modify_db_chained(|db| {
+            db.insert_account_info(
+                caller,
+                revm::state::AccountInfo {
+                    balance: alloy_primitives::U256::from(1_000_000_000_000_000_000u128),
+                    ..Default::default()
+                },
+            );
+        })
+        .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN);
+
+    let mut evm = context.build_mainnet();
+    let addr = deploy_contract(&mut evm, code.into(), caller, SpecId::CANCUN)
+        .created_address()
+        .unwrap();
+
+    let prestate_config = PreStateConfig {
+        diff_mode: Some(true),
+        disable_code: Some(false),
+        disable_storage: Some(false),
+    };
+    let insp =
+        TracingInspector::new(TracingInspectorConfig::from_geth_prestate_config(&prestate_config));
+
+    let db = evm.ctx().db().clone();
+    let mut evm = evm.with_inspector(insp);
+    evm.set_tx(TxEnv {
+        caller,
+        gas_limit: 1_000_000,
+        kind: TransactTo::Call(addr),
+        nonce: 1,
+        ..Default::default()
+    });
+    let res = evm.inspect_replay().unwrap();
+    assert!(res.result.is_success(), "{res:#?}");
+
+    let insp = evm.into_inspector();
+    // A limit far below the 2000-byte contract code, but above the caller-only pruned diff.
+    let (frame, size) = insp
+        .with_transaction_gas_used(res.result.gas_used())
+        .geth_builder()
+        .geth_prestate_traces_with_size_limit(&res, &prestate_config, db, Some(1024))
+        .expect("a small pruned diff must not be rejected for the code it merely touched");
+
+    assert!(
+        size <= 1024,
+        "charged size {size} must reflect the pruned diff, not the pre-prune state"
+    );
+    match frame {
+        PreStateFrame::Diff(diff) => {
+            assert!(
+                !diff.pre.contains_key(&addr) && !diff.post.contains_key(&addr),
+                "the unchanged contract must be pruned from both sides of the diff"
+            );
+        }
+        _ => panic!("Expected Diff mode PreStateFrame"),
+    }
+}
