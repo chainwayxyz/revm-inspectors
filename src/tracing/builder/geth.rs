@@ -489,7 +489,7 @@ mod tests {
         );
 
         let builder = GethTraceBuilder::new(Vec::new());
-        let frame =
+        let (frame, _size) =
             builder.geth_prestate_diff_traces(&state, db, false, false, None).expect("diff frame");
 
         match frame {
