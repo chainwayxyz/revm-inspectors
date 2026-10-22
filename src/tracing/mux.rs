@@ -1,6 +1,5 @@
 use crate::tracing::{
-    geth::PrestateError, parity::FlatCallMaxResponseSizeError, FourByteInspector, TracingInspector,
-    TracingInspectorConfig,
+    geth::PrestateError, FourByteInspector, TracingInspector, TracingInspectorConfig,
 };
 use alloc::vec::Vec;
 use alloy_primitives::{map::HashMap, Address, Log, U256};
@@ -147,6 +146,9 @@ impl MuxInspector {
         // bounded by what is left of `max_size`, and the sum is returned so the caller can charge
         // it against a shared budget.
         let mut retained_size = 0usize;
+        // A sub-trace that runs out reports the residual it was handed; report `max_size` instead,
+        // so the error does not depend on which sub-trace was built first.
+        let exceeded = || PrestateError::MaxResponseSize { limit: max_size.unwrap_or_default() };
 
         for (tracer_type, config) in &self.configs {
             let trace = match config {
@@ -162,13 +164,18 @@ impl MuxInspector {
                 }
                 TraceConfig::PreState(prestate_config) => {
                     if let Some(inspector) = &self.tracing {
-                        let (prestate_frame, size) =
-                            inspector.geth_builder().geth_prestate_traces_with_size_limit(
+                        let (prestate_frame, size) = inspector
+                            .geth_builder()
+                            .geth_prestate_traces_with_size_limit(
                                 result,
                                 prestate_config,
                                 db,
                                 max_size.map(|limit| limit.saturating_sub(retained_size)),
-                            )?;
+                            )
+                            .map_err(|err| match err {
+                                PrestateError::MaxResponseSize { .. } => exceeded(),
+                                err => err,
+                            })?;
                         retained_size = retained_size.saturating_add(size);
                         prestate_frame.into()
                     } else {
@@ -184,9 +191,7 @@ impl MuxInspector {
                                 tx_info,
                                 max_size.map(|limit| limit.saturating_sub(retained_size)),
                             )
-                            .map_err(|FlatCallMaxResponseSizeError { limit }| {
-                                PrestateError::MaxResponseSize { limit }
-                            })?;
+                            .map_err(|_| exceeded())?;
                         retained_size = retained_size.saturating_add(size);
                         traces.into()
                     } else {

@@ -18,7 +18,9 @@ use revm::{
     state::AccountInfo,
     Context, InspectEvm, MainBuilder, MainContext,
 };
-use revm_inspectors::tracing::{MuxInspector, TracingInspector, TracingInspectorConfig};
+use revm_inspectors::tracing::{
+    geth::PrestateError, MuxInspector, TracingInspector, TracingInspectorConfig,
+};
 
 #[test]
 fn test_geth_calltracer_logs() {
@@ -243,11 +245,11 @@ fn test_geth_mux_tracer() {
 }
 
 /// Runs a call that makes one nested call under a mux of `tracers` and returns the retained size
-/// the mux reports for `max_size`, or `None` if the mux rejected the response.
+/// the mux reports for `max_size`, or the limit its error names if the mux rejected the response.
 fn mux_retained_size(
     tracers: &[GethDebugBuiltInTracerType],
     max_size: Option<usize>,
-) -> Option<usize> {
+) -> Result<usize, usize> {
     // 5x PUSH1 0 (call args), PUSH20 0x42..42, GAS, CALL, STOP
     let code = hex!("6000600060006000600073" "4242424242424242424242424242424242424242" "5af100");
     let contract = Address::repeat_byte(0xaa);
@@ -282,15 +284,16 @@ fn mux_retained_size(
     assert!(res.result.is_success());
 
     let (ctx, inspector) = evm.ctx_inspector();
-    inspector
-        .try_into_mux_frame_with_size_limit(
-            &res,
-            ctx.db_ref(),
-            TransactionInfo::default(),
-            max_size,
-        )
-        .ok()
-        .map(|(_, size)| size)
+    match inspector.try_into_mux_frame_with_size_limit(
+        &res,
+        ctx.db_ref(),
+        TransactionInfo::default(),
+        max_size,
+    ) {
+        Ok((_, size)) => Ok(size),
+        Err(PrestateError::MaxResponseSize { limit }) => Err(limit),
+        Err(err) => panic!("{err}"),
+    }
 }
 
 #[test]
@@ -305,11 +308,12 @@ fn test_geth_mux_size_limit_is_cumulative() {
 
     let both = [PreStateTracer, FlatCallTracer];
     let sum = prestate + flat_call;
-    assert_eq!(mux_retained_size(&both, None), Some(sum));
-    assert_eq!(mux_retained_size(&both, Some(sum)), Some(sum));
-    // each sub-trace fits this limit on its own, but their sum does not
+    assert_eq!(mux_retained_size(&both, None), Ok(sum));
+    assert_eq!(mux_retained_size(&both, Some(sum)), Ok(sum));
+    // each sub-trace fits this limit on its own, but their sum does not; the error names the
+    // limit passed in, not the residual the rejected sub-trace was handed
     assert!(prestate.max(flat_call) < sum);
-    assert_eq!(mux_retained_size(&both, Some(sum - 1)), None);
+    assert_eq!(mux_retained_size(&both, Some(sum - 1)), Err(sum - 1));
 }
 
 #[test]
