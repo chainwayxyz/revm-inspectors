@@ -164,10 +164,9 @@ impl ParityTraceBuilder {
     ///
     /// The flat-call output stores one `traceAddress` vector per emitted trace whose length equals
     /// that trace's depth, so the retained total is `size_of::<usize>() * Σ(depth)` across all
-    /// emitted traces (one per non-precompile node, plus one extra per selfdestruct). A per-step
-    /// memory limiter wrapping the inspector never sees this: it charges the call arena, which is
-    /// `O(nodes)`, while this payload is `O(Σ depth)` and only materializes at conversion. This
-    /// walks the arena without allocating the vectors so a caller can reject or charge it first.
+    /// emitted traces (one per non-precompile node, plus one extra per selfdestruct). This walks
+    /// the arena without allocating the vectors so a caller can bound or charge the payload
+    /// before building it.
     fn flat_trace_address_retained_bytes(&self) -> usize {
         if self.nodes.is_empty() {
             return 0;
@@ -198,9 +197,9 @@ impl ParityTraceBuilder {
     /// payload size alongside the traces so a caller sharing a budget across a block can charge it.
     /// `None` disables the limit.
     ///
-    /// This payload survives in the returned RPC object yet is invisible to a per-step memory
-    /// limiter, so without this check a deep, wide call tree can build a multi-GiB flat-call
-    /// response under a far smaller recorded budget. See [`Self::flat_trace_address_retained_bytes`].
+    /// The payload is the `traceAddress` vectors, `size_of::<usize>()` bytes per element: one
+    /// vector per emitted trace whose length is that trace's depth. It is measured without
+    /// allocating the vectors.
     pub fn try_into_localized_transaction_traces_with_size_limit(
         self,
         info: TransactionInfo,

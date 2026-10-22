@@ -126,11 +126,14 @@ impl MuxInspector {
             })
     }
 
-    /// Like [`Self::try_into_mux_frame`], but bounds the bytes a prestate sub-trace may retain and
-    /// reports how many it did; see
-    /// [`GethTraceBuilder::geth_prestate_traces_with_size_limit`](crate::tracing::geth::GethTraceBuilder::geth_prestate_traces_with_size_limit).
-    /// A mux holds at most one prestate tracer, so the count is that sub-trace's retained size (or
-    /// zero), which a caller can charge against a budget shared across a block's transactions.
+    /// Like [`Self::try_into_mux_frame`], but bounds the bytes the prestate and flat-call
+    /// sub-traces may retain and reports how many they did; see
+    /// [`GethTraceBuilder::geth_prestate_traces_with_size_limit`](crate::tracing::geth::GethTraceBuilder::geth_prestate_traces_with_size_limit)
+    /// and
+    /// [`ParityTraceBuilder::try_into_localized_transaction_traces_with_size_limit`](crate::tracing::parity::ParityTraceBuilder::try_into_localized_transaction_traces_with_size_limit).
+    /// Each sub-trace is bounded by `max_size` on its own. The count is the sum of their retained
+    /// sizes (or zero), which a caller can charge against a budget shared across a block's
+    /// transactions.
     pub fn try_into_mux_frame_with_size_limit<DB: DatabaseRef>(
         &self,
         result: &ResultAndState<impl HaltReasonTr>,
@@ -158,9 +161,8 @@ impl MuxInspector {
                 }
                 TraceConfig::PreState(prestate_config) => {
                     if let Some(inspector) = &self.tracing {
-                        let (prestate_frame, size) = inspector
-                            .geth_builder()
-                            .geth_prestate_traces_with_size_limit(
+                        let (prestate_frame, size) =
+                            inspector.geth_builder().geth_prestate_traces_with_size_limit(
                                 result,
                                 prestate_config,
                                 db,

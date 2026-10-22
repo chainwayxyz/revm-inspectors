@@ -188,8 +188,7 @@ impl<'a> GethTraceBuilder<'a> {
             // last, which is where inserting each child at the front used to leave it.
             //
             // Appending and reversing once is what keeps this linear: inserting every child at the
-            // front makes assembling a frame with `n` children `O(n^2)` moves of a `CallFrame`,
-            // which is enough to hang the tracer for minutes on a call heavy transaction.
+            // front makes assembling a frame with `n` children `O(n^2)` moves of a `CallFrame`.
             call.calls.reverse();
 
             if let Some(parent) = node.parent {
@@ -248,8 +247,8 @@ impl<'a> GethTraceBuilder<'a> {
     /// The frame is built from post-execution state after tracing, so a memory budget enforced over
     /// a tracer's recorded steps does not cover it. When `max_size` is set, building fails with
     /// [`PrestateError::MaxResponseSize`] once the retained frame would exceed it, keeping the size
-    /// bounded regardless of how many accounts the transaction touched. The returned count (see
-    /// [`account_state_size`] for the estimate) lets a caller charge the frame against a budget
+    /// bounded regardless of how many accounts the transaction touched. The returned count (an
+    /// estimate, see `account_state_size`) lets a caller charge the frame against a budget
     /// shared across a block's transactions, since each call is bounded only against `max_size`.
     pub fn geth_prestate_traces_with_size_limit<DB: DatabaseRef>(
         &self,
@@ -294,7 +293,8 @@ impl<'a> GethTraceBuilder<'a> {
 
             // Prestate mode retains every account it builds (nothing is pruned), so charge each one
             // as it is added and abort before the map grows past the budget; the overshoot is
-            // bounded by the one account in flight (its storage and <= 24 KiB of code under EIP-170).
+            // bounded by the one account in flight (its storage and <= 24 KiB of code under
+            // EIP-170).
             size += account_state_size(&acc_state);
             if let Some(limit) = max_size.filter(|limit| size > *limit) {
                 return Err(PrestateError::MaxResponseSize { limit });
@@ -440,14 +440,15 @@ fn account_state_size(acc: &AccountState) -> usize {
         + acc.storage.len() * (2 * core::mem::size_of::<B256>() + BTREE_ENTRY_OVERHEAD)
 }
 
-/// Error returned while building a geth prestate trace under a response size budget.
+/// Error returned while building a geth prestate trace under a response size budget. A mux frame
+/// also returns it when its flat-call sub-trace exceeds the budget.
 #[derive(Debug, thiserror::Error)]
 pub enum PrestateError<E> {
     /// A database error occurred while fetching pre-transaction state.
     #[error(transparent)]
     Database(E),
-    /// Building the prestate response would retain more than `limit` bytes; building was aborted
-    /// before the full response was materialized.
+    /// Building the response would retain more than `limit` bytes; building was aborted before
+    /// the full response was materialized.
     #[error("prestate response exceeded the memory limit of {limit} bytes")]
     MaxResponseSize {
         /// The configured byte budget that was exceeded.

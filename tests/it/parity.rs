@@ -507,7 +507,7 @@ fn test_flat_call_trace_address_size_limit() {
     let builder = evm.into_inspector().into_parity_builder();
 
     // The preflight must exactly equal the traceAddress bytes the real output retains: undercount
-    // would let the bypass through, overcount would reject legitimate traces.
+    // would under-charge the payload, overcount would reject legitimate traces.
     let traces_ref = builder.clone().into_localized_transaction_traces(TransactionInfo::default());
     let expected = traces_ref.iter().map(|t| t.trace.trace_address.len()).sum::<usize>()
         * core::mem::size_of::<usize>();

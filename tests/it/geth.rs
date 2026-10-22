@@ -838,9 +838,8 @@ fn test_geth_prestate_diff_size_limit_charges_pruned_diff() {
         .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN);
 
     let mut evm = context.build_mainnet();
-    let addr = deploy_contract(&mut evm, code.into(), caller, SpecId::CANCUN)
-        .created_address()
-        .unwrap();
+    let addr =
+        deploy_contract(&mut evm, code.into(), caller, SpecId::CANCUN).created_address().unwrap();
 
     let prestate_config = PreStateConfig {
         diff_mode: Some(true),
