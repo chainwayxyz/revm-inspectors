@@ -7,6 +7,7 @@ use alloy_rpc_types_trace::geth::{
     GethTrace, PreStateConfig, PreStateFrame,
 };
 use revm::{
+    bytecode::Bytecode,
     context::{ContextSetters, TxEnv},
     context_interface::{ContextTr, TransactTo},
     database::CacheDB,
@@ -14,6 +15,7 @@ use revm::{
     handler::EvmTr,
     inspector::InspectorEvmTr,
     primitives::hardfork::SpecId,
+    state::AccountInfo,
     Context, InspectEvm, MainBuilder, MainContext,
 };
 use revm_inspectors::tracing::{MuxInspector, TracingInspector, TracingInspectorConfig};
@@ -238,6 +240,76 @@ fn test_geth_mux_tracer() {
         }
         _ => panic!("Expected FlatCallTracer"),
     }
+}
+
+/// Runs a call that makes one nested call under a mux of `tracers` and returns the retained size
+/// the mux reports for `max_size`, or `None` if the mux rejected the response.
+fn mux_retained_size(
+    tracers: &[GethDebugBuiltInTracerType],
+    max_size: Option<usize>,
+) -> Option<usize> {
+    // 5x PUSH1 0 (call args), PUSH20 0x42..42, GAS, CALL, STOP
+    let code = hex!("6000600060006000600073" "4242424242424242424242424242424242424242" "5af100");
+    let contract = Address::repeat_byte(0xaa);
+    let mut evm = Context::mainnet()
+        .with_db(CacheDB::<EmptyDB>::default())
+        .modify_db_chained(|db| {
+            db.insert_account_info(
+                contract,
+                AccountInfo { code: Some(Bytecode::new_raw(code.into())), ..Default::default() },
+            );
+        })
+        .build_mainnet();
+
+    let config = MuxConfig(HashMap::from_iter(tracers.iter().map(|tracer| {
+        let config = match tracer {
+            GethDebugBuiltInTracerType::PreStateTracer => {
+                serde_json::to_value(PreStateConfig::default())
+            }
+            _ => serde_json::to_value(FlatCallConfig::default()),
+        };
+        (*tracer, Some(GethDebugTracerConfig(config.unwrap())))
+    })));
+    let mut insp = MuxInspector::try_from_config(config).unwrap();
+
+    evm.ctx().set_tx(TxEnv {
+        gas_limit: 1000000,
+        kind: TransactTo::Call(contract),
+        ..Default::default()
+    });
+    let mut evm = evm.with_inspector(&mut insp);
+    let res = evm.inspect_replay().unwrap();
+    assert!(res.result.is_success());
+
+    let (ctx, inspector) = evm.ctx_inspector();
+    inspector
+        .try_into_mux_frame_with_size_limit(
+            &res,
+            ctx.db_ref(),
+            TransactionInfo::default(),
+            max_size,
+        )
+        .ok()
+        .map(|(_, size)| size)
+}
+
+#[test]
+fn test_geth_mux_size_limit_is_cumulative() {
+    use GethDebugBuiltInTracerType::{FlatCallTracer, PreStateTracer};
+
+    let prestate = mux_retained_size(&[PreStateTracer], None).unwrap();
+    let flat_call = mux_retained_size(&[FlatCallTracer], None).unwrap();
+    assert!(prestate > 0);
+    // the nested call sits at depth 1: one traceAddress element
+    assert_eq!(flat_call, core::mem::size_of::<usize>());
+
+    let both = [PreStateTracer, FlatCallTracer];
+    let sum = prestate + flat_call;
+    assert_eq!(mux_retained_size(&both, None), Some(sum));
+    assert_eq!(mux_retained_size(&both, Some(sum)), Some(sum));
+    // each sub-trace fits this limit on its own, but their sum does not
+    assert!(prestate.max(flat_call) < sum);
+    assert_eq!(mux_retained_size(&both, Some(sum - 1)), None);
 }
 
 #[test]
