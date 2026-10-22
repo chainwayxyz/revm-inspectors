@@ -25,6 +25,16 @@ pub struct ParityTraceBuilder {
     nodes: Vec<CallTraceNode>,
 }
 
+/// Error returned by
+/// [`ParityTraceBuilder::try_into_localized_transaction_traces_with_size_limit`] when the flat-call
+/// response would retain more than the configured number of `traceAddress` bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("flat call trace response exceeded the memory limit of {limit} bytes")]
+pub struct FlatCallMaxResponseSizeError {
+    /// The configured byte budget that was exceeded.
+    pub limit: usize,
+}
+
 impl ParityTraceBuilder {
     /// Returns a new instance of the builder
     pub fn new(
@@ -148,6 +158,59 @@ impl ParityTraceBuilder {
         info: TransactionInfo,
     ) -> Vec<LocalizedTransactionTrace> {
         self.into_localized_transaction_traces_iter(info).collect()
+    }
+
+    /// Bytes of `traceAddress` payload the flat-call output would retain.
+    ///
+    /// The flat-call output stores one `traceAddress` vector per emitted trace whose length equals
+    /// that trace's depth, so the retained total is `size_of::<usize>() * Σ(depth)` across all
+    /// emitted traces (one per non-precompile node, plus one extra per selfdestruct). A per-step
+    /// memory limiter wrapping the inspector never sees this: it charges the call arena, which is
+    /// `O(nodes)`, while this payload is `O(Σ depth)` and only materializes at conversion. This
+    /// walks the arena without allocating the vectors so a caller can reject or charge it first.
+    fn flat_trace_address_retained_bytes(&self) -> usize {
+        if self.nodes.is_empty() {
+            return 0;
+        }
+        // trace_address length == arena depth (root is 0). Nodes are stored parent-before-child, so
+        // one forward pass resolves every depth.
+        let mut depth = vec![0usize; self.nodes.len()];
+        let mut total_len = 0usize;
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if let Some(parent) = node.parent {
+                depth[idx] = depth.get(parent).copied().unwrap_or(0).saturating_add(1);
+            }
+            if node.is_precompile() {
+                // filtered out of the flat-call output
+                continue;
+            }
+            total_len = total_len.saturating_add(depth[idx]);
+            if node.is_selfdestruct() {
+                // emits an additional trace whose address is this node's plus one element
+                total_len = total_len.saturating_add(depth[idx].saturating_add(1));
+            }
+        }
+        total_len.saturating_mul(core::mem::size_of::<usize>())
+    }
+
+    /// Like [`Self::into_localized_transaction_traces`], but first rejects the trace if the
+    /// `traceAddress` payload it would retain exceeds `max_size` bytes, and otherwise returns that
+    /// payload size alongside the traces so a caller sharing a budget across a block can charge it.
+    /// `None` disables the limit.
+    ///
+    /// This payload survives in the returned RPC object yet is invisible to a per-step memory
+    /// limiter, so without this check a deep, wide call tree can build a multi-GiB flat-call
+    /// response under a far smaller recorded budget. See [`Self::flat_trace_address_retained_bytes`].
+    pub fn try_into_localized_transaction_traces_with_size_limit(
+        self,
+        info: TransactionInfo,
+        max_size: Option<usize>,
+    ) -> Result<(Vec<LocalizedTransactionTrace>, usize), FlatCallMaxResponseSizeError> {
+        let size = self.flat_trace_address_retained_bytes();
+        if let Some(limit) = max_size.filter(|limit| size > *limit) {
+            return Err(FlatCallMaxResponseSizeError { limit });
+        }
+        Ok((self.into_localized_transaction_traces(info), size))
     }
 
     /// Consumes the inspector and returns the trace results according to the configured trace

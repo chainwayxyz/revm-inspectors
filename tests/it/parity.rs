@@ -463,3 +463,76 @@ fn test_parity_delegatecall_selfdestruct() {
     assert_eq!(action2.address, delegate_addr);
     assert_eq!(action2.refund_address, deployer);
 }
+
+#[test]
+fn test_flat_call_trace_address_size_limit() {
+    // Reuses the call+selfdestruct scenario so the size accounting covers both the per-node
+    // traceAddress and the extra entry a selfdestruct emits.
+    let caller = address!("500a229A1047D3D684210BF1b67A26eB2994794a");
+    let balance = U256::from(50000000000000000u128);
+    let input = hex!("43d726d6");
+    let code = hex!("608080604052606b908160108239f3fe6004361015600c57600080fd5b6000803560e01c6343d726d614602157600080fd5b346032578060031936011260325733ff5b80fdfea2646970667358221220f393fc6be90126d52315ccd38ae6608ac4fd5bef4c59e119e280b2a2b149d0dc64736f6c63430008190033");
+    let deployer = address!("341348115259a8bf69f1f50101c227fced83bac6");
+    let value = U256::from(69);
+
+    let mut evm = Context::mainnet()
+        .with_db(CacheDB::<EmptyDB>::default())
+        .modify_db_chained(|db| {
+            db.insert_account_info(deployer, AccountInfo { balance: value, ..Default::default() });
+        })
+        .modify_tx_chained(|tx| {
+            tx.caller = deployer;
+            tx.value = value;
+        })
+        .build_mainnet();
+
+    let to =
+        deploy_contract(&mut evm, code.into(), deployer, SpecId::LONDON).created_address().unwrap();
+    evm.ctx().db().cache.accounts.get_mut(&to).unwrap().info.balance = balance;
+    evm.ctx().modify_tx(|tx| {
+        *tx = TxEnv {
+            caller,
+            gas_limit: 100000000,
+            kind: TransactTo::Call(to),
+            data: input.to_vec().into(),
+            nonce: 0,
+            ..Default::default()
+        };
+    });
+
+    let mut evm =
+        evm.with_inspector(TracingInspector::new(TracingInspectorConfig::default_parity()));
+    let res = evm.inspect_replay().unwrap();
+    evm.ctx().db().commit(res.state);
+    let builder = evm.into_inspector().into_parity_builder();
+
+    // The preflight must exactly equal the traceAddress bytes the real output retains: undercount
+    // would let the bypass through, overcount would reject legitimate traces.
+    let traces_ref = builder.clone().into_localized_transaction_traces(TransactionInfo::default());
+    let expected = traces_ref.iter().map(|t| t.trace.trace_address.len()).sum::<usize>()
+        * core::mem::size_of::<usize>();
+    assert!(expected > 0, "the selfdestruct scenario retains at least one traceAddress element");
+
+    // No limit: same traces, reported size equals the retained bytes.
+    let (traces, size) = builder
+        .clone()
+        .try_into_localized_transaction_traces_with_size_limit(TransactionInfo::default(), None)
+        .unwrap();
+    assert_eq!(size, expected);
+    assert_eq!(traces, traces_ref);
+
+    // Exactly at the limit is allowed; one byte under is rejected.
+    assert!(builder
+        .clone()
+        .try_into_localized_transaction_traces_with_size_limit(
+            TransactionInfo::default(),
+            Some(expected)
+        )
+        .is_ok());
+    assert!(builder
+        .try_into_localized_transaction_traces_with_size_limit(
+            TransactionInfo::default(),
+            Some(expected - 1)
+        )
+        .is_err());
+}

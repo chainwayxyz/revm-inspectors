@@ -1,5 +1,6 @@
 use crate::tracing::{
-    geth::PrestateError, FourByteInspector, TracingInspector, TracingInspectorConfig,
+    geth::PrestateError, parity::FlatCallMaxResponseSizeError, FourByteInspector, TracingInspector,
+    TracingInspectorConfig,
 };
 use alloc::vec::Vec;
 use alloy_primitives::{map::HashMap, Address, Log, U256};
@@ -138,7 +139,10 @@ impl MuxInspector {
         max_size: Option<usize>,
     ) -> Result<(MuxFrame, usize), PrestateError<DB::Error>> {
         let mut frame = HashMap::with_capacity_and_hasher(self.configs.len(), Default::default());
-        let mut prestate_size = 0usize;
+        // Sum of the response bytes built after execution that the per-step limiter never charged:
+        // the prestate frame and the flat-call `traceAddress` payload. Returned so the caller can
+        // charge it against a shared budget.
+        let mut retained_size = 0usize;
 
         for (tracer_type, config) in &self.configs {
             let trace = match config {
@@ -162,7 +166,7 @@ impl MuxInspector {
                                 db,
                                 max_size,
                             )?;
-                        prestate_size += size;
+                        retained_size += size;
                         prestate_frame.into()
                     } else {
                         continue;
@@ -170,11 +174,17 @@ impl MuxInspector {
                 }
                 TraceConfig::FlatCall(_flatcall_config) => {
                     if let Some(inspector) = &self.tracing {
-                        inspector
+                        let (traces, size) = inspector
                             .clone()
                             .into_parity_builder()
-                            .into_localized_transaction_traces(tx_info)
-                            .into()
+                            .try_into_localized_transaction_traces_with_size_limit(
+                                tx_info, max_size,
+                            )
+                            .map_err(|FlatCallMaxResponseSizeError { limit }| {
+                                PrestateError::MaxResponseSize { limit }
+                            })?;
+                        retained_size += size;
+                        traces.into()
                     } else {
                         continue;
                     }
@@ -193,7 +203,7 @@ impl MuxInspector {
             );
         }
 
-        Ok((MuxFrame(frame), prestate_size))
+        Ok((MuxFrame(frame), retained_size))
     }
 }
 
