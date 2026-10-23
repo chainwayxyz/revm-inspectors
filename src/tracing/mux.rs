@@ -1,4 +1,6 @@
-use crate::tracing::{FourByteInspector, TracingInspector, TracingInspectorConfig};
+use crate::tracing::{
+    geth::PrestateError, FourByteInspector, TracingInspector, TracingInspectorConfig,
+};
 use alloc::vec::Vec;
 use alloy_primitives::{map::HashMap, Address, Log, U256};
 use alloy_rpc_types_eth::TransactionInfo;
@@ -100,6 +102,13 @@ impl MuxInspector {
         Ok(MuxInspector { four_byte, tracing, configs })
     }
 
+    /// The configuration of the inner tracing inspector: the union of what every muxed tracer
+    /// records. Returns [`None`] when the mux holds only tracers that run without one (the four
+    /// byte and noop tracers). Lets a caller size a budget from what the mux actually retains.
+    pub fn tracing_config(&self) -> Option<&TracingInspectorConfig> {
+        self.tracing.as_ref().map(TracingInspector::config)
+    }
+
     /// Try converting this [MuxInspector] into a [MuxFrame].
     pub fn try_into_mux_frame<DB: DatabaseRef>(
         &self,
@@ -107,7 +116,39 @@ impl MuxInspector {
         db: &DB,
         tx_info: TransactionInfo,
     ) -> Result<MuxFrame, DB::Error> {
+        self.try_into_mux_frame_with_size_limit(result, db, tx_info, None)
+            .map(|(frame, _size)| frame)
+            .map_err(|e| match e {
+                PrestateError::Database(e) => e,
+                // `None` above disables the size check, so this variant is never produced.
+                PrestateError::MaxResponseSize { .. } => unreachable!("no size limit was set"),
+            })
+    }
+
+    /// Like [`Self::try_into_mux_frame`], but bounds the bytes the prestate and flat-call
+    /// sub-traces may retain and reports how many they did; see
+    /// [`GethTraceBuilder::geth_prestate_traces_with_size_limit`](crate::tracing::geth::GethTraceBuilder::geth_prestate_traces_with_size_limit)
+    /// and
+    /// [`ParityTraceBuilder::try_into_localized_transaction_traces_with_size_limit`](crate::tracing::parity::ParityTraceBuilder::try_into_localized_transaction_traces_with_size_limit).
+    /// The sub-traces share `max_size`, so their combined size never exceeds it. The count is the
+    /// sum of their retained sizes (or zero), which a caller can charge against a budget shared
+    /// across a block's transactions.
+    pub fn try_into_mux_frame_with_size_limit<DB: DatabaseRef>(
+        &self,
+        result: &ResultAndState<impl HaltReasonTr>,
+        db: &DB,
+        tx_info: TransactionInfo,
+        max_size: Option<usize>,
+    ) -> Result<(MuxFrame, usize), PrestateError<DB::Error>> {
         let mut frame = HashMap::with_capacity_and_hasher(self.configs.len(), Default::default());
+        // Sum of the response bytes built after execution that the per-step limiter never charged:
+        // the prestate frame and the flat-call `traceAddress` payload. Each later sub-trace is
+        // bounded by what is left of `max_size`, and the sum is returned so the caller can charge
+        // it against a shared budget.
+        let mut retained_size = 0usize;
+        // A sub-trace that runs out reports the residual it was handed; report `max_size` instead,
+        // so the error does not depend on which sub-trace was built first.
+        let exceeded = || PrestateError::MaxResponseSize { limit: max_size.unwrap_or_default() };
 
         for (tracer_type, config) in &self.configs {
             let trace = match config {
@@ -123,21 +164,36 @@ impl MuxInspector {
                 }
                 TraceConfig::PreState(prestate_config) => {
                     if let Some(inspector) = &self.tracing {
-                        inspector
+                        let (prestate_frame, size) = inspector
                             .geth_builder()
-                            .geth_prestate_traces(result, prestate_config, db)?
-                            .into()
+                            .geth_prestate_traces_with_size_limit(
+                                result,
+                                prestate_config,
+                                db,
+                                max_size.map(|limit| limit.saturating_sub(retained_size)),
+                            )
+                            .map_err(|err| match err {
+                                PrestateError::MaxResponseSize { .. } => exceeded(),
+                                err => err,
+                            })?;
+                        retained_size = retained_size.saturating_add(size);
+                        prestate_frame.into()
                     } else {
                         continue;
                     }
                 }
                 TraceConfig::FlatCall(_flatcall_config) => {
                     if let Some(inspector) = &self.tracing {
-                        inspector
+                        let (traces, size) = inspector
                             .clone()
                             .into_parity_builder()
-                            .into_localized_transaction_traces(tx_info)
-                            .into()
+                            .try_into_localized_transaction_traces_with_size_limit(
+                                tx_info,
+                                max_size.map(|limit| limit.saturating_sub(retained_size)),
+                            )
+                            .map_err(|_| exceeded())?;
+                        retained_size = retained_size.saturating_add(size);
+                        traces.into()
                     } else {
                         continue;
                     }
@@ -156,7 +212,7 @@ impl MuxInspector {
             );
         }
 
-        Ok(MuxFrame(frame))
+        Ok((MuxFrame(frame), retained_size))
     }
 }
 

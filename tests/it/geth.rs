@@ -7,6 +7,7 @@ use alloy_rpc_types_trace::geth::{
     GethTrace, PreStateConfig, PreStateFrame,
 };
 use revm::{
+    bytecode::Bytecode,
     context::{ContextSetters, TxEnv},
     context_interface::{ContextTr, TransactTo},
     database::CacheDB,
@@ -14,9 +15,12 @@ use revm::{
     handler::EvmTr,
     inspector::InspectorEvmTr,
     primitives::hardfork::SpecId,
+    state::AccountInfo,
     Context, InspectEvm, MainBuilder, MainContext,
 };
-use revm_inspectors::tracing::{MuxInspector, TracingInspector, TracingInspectorConfig};
+use revm_inspectors::tracing::{
+    geth::PrestateError, MuxInspector, TracingInspector, TracingInspectorConfig,
+};
 
 #[test]
 fn test_geth_calltracer_logs() {
@@ -238,6 +242,78 @@ fn test_geth_mux_tracer() {
         }
         _ => panic!("Expected FlatCallTracer"),
     }
+}
+
+/// Runs a call that makes one nested call under a mux of `tracers` and returns the retained size
+/// the mux reports for `max_size`, or the limit its error names if the mux rejected the response.
+fn mux_retained_size(
+    tracers: &[GethDebugBuiltInTracerType],
+    max_size: Option<usize>,
+) -> Result<usize, usize> {
+    // 5x PUSH1 0 (call args), PUSH20 0x42..42, GAS, CALL, STOP
+    let code = hex!("6000600060006000600073" "4242424242424242424242424242424242424242" "5af100");
+    let contract = Address::repeat_byte(0xaa);
+    let mut evm = Context::mainnet()
+        .with_db(CacheDB::<EmptyDB>::default())
+        .modify_db_chained(|db| {
+            db.insert_account_info(
+                contract,
+                AccountInfo { code: Some(Bytecode::new_raw(code.into())), ..Default::default() },
+            );
+        })
+        .build_mainnet();
+
+    let config = MuxConfig(HashMap::from_iter(tracers.iter().map(|tracer| {
+        let config = match tracer {
+            GethDebugBuiltInTracerType::PreStateTracer => {
+                serde_json::to_value(PreStateConfig::default())
+            }
+            _ => serde_json::to_value(FlatCallConfig::default()),
+        };
+        (*tracer, Some(GethDebugTracerConfig(config.unwrap())))
+    })));
+    let mut insp = MuxInspector::try_from_config(config).unwrap();
+
+    evm.ctx().set_tx(TxEnv {
+        gas_limit: 1000000,
+        kind: TransactTo::Call(contract),
+        ..Default::default()
+    });
+    let mut evm = evm.with_inspector(&mut insp);
+    let res = evm.inspect_replay().unwrap();
+    assert!(res.result.is_success());
+
+    let (ctx, inspector) = evm.ctx_inspector();
+    match inspector.try_into_mux_frame_with_size_limit(
+        &res,
+        ctx.db_ref(),
+        TransactionInfo::default(),
+        max_size,
+    ) {
+        Ok((_, size)) => Ok(size),
+        Err(PrestateError::MaxResponseSize { limit }) => Err(limit),
+        Err(err) => panic!("{err}"),
+    }
+}
+
+#[test]
+fn test_geth_mux_size_limit_is_cumulative() {
+    use GethDebugBuiltInTracerType::{FlatCallTracer, PreStateTracer};
+
+    let prestate = mux_retained_size(&[PreStateTracer], None).unwrap();
+    let flat_call = mux_retained_size(&[FlatCallTracer], None).unwrap();
+    assert!(prestate > 0);
+    // the nested call sits at depth 1: one traceAddress element
+    assert_eq!(flat_call, core::mem::size_of::<usize>());
+
+    let both = [PreStateTracer, FlatCallTracer];
+    let sum = prestate + flat_call;
+    assert_eq!(mux_retained_size(&both, None), Ok(sum));
+    assert_eq!(mux_retained_size(&both, Some(sum)), Ok(sum));
+    // each sub-trace fits this limit on its own, but their sum does not; the error names the
+    // limit passed in, not the residual the rejected sub-trace was handed
+    assert!(prestate.max(flat_call) < sum);
+    assert_eq!(mux_retained_size(&both, Some(sum - 1)), Err(sum - 1));
 }
 
 #[test]
@@ -791,6 +867,94 @@ fn test_geth_prestate_diff_selfdestruct(spec_id: SpecId) {
                     "Selfdestructed account should be in pre state (LONDON)"
                 );
             }
+        }
+        _ => panic!("Expected Diff mode PreStateFrame"),
+    }
+}
+
+/// A diff-mode prestate that touches a large-code contract without changing it must be charged for
+/// the *pruned* diff, not the full pre/post state built before pruning. Calling a contract whose
+/// runtime is all `STOP` changes no state, so `retain_changed` drops it (and its code) from both
+/// sides, leaving only the caller's gas/nonce change. A size limit far below that code must still
+/// admit the request, and the reported size must be the small pruned diff.
+#[test]
+fn test_geth_prestate_diff_size_limit_charges_pruned_diff() {
+    // init code returning a 2000-byte all-`STOP` runtime:
+    // PUSH2 len; DUP1; PUSH1 12; PUSH1 0; CODECOPY; PUSH1 0; RETURN; <runtime>
+    let runtime = vec![0u8; 2000];
+    let mut code = vec![
+        0x61,
+        (runtime.len() >> 8) as u8,
+        runtime.len() as u8,
+        0x80,
+        0x60,
+        0x0c,
+        0x60,
+        0x00,
+        0x39,
+        0x60,
+        0x00,
+        0xf3,
+    ];
+    code.extend_from_slice(&runtime);
+
+    let caller = alloy_primitives::address!("341348115259a8bf69f1f50101c227fced83bac6");
+
+    let context = Context::mainnet()
+        .with_db(CacheDB::<EmptyDB>::default())
+        .modify_db_chained(|db| {
+            db.insert_account_info(
+                caller,
+                revm::state::AccountInfo {
+                    balance: alloy_primitives::U256::from(1_000_000_000_000_000_000u128),
+                    ..Default::default()
+                },
+            );
+        })
+        .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN);
+
+    let mut evm = context.build_mainnet();
+    let addr =
+        deploy_contract(&mut evm, code.into(), caller, SpecId::CANCUN).created_address().unwrap();
+
+    let prestate_config = PreStateConfig {
+        diff_mode: Some(true),
+        disable_code: Some(false),
+        disable_storage: Some(false),
+    };
+    let insp =
+        TracingInspector::new(TracingInspectorConfig::from_geth_prestate_config(&prestate_config));
+
+    let db = evm.ctx().db().clone();
+    let mut evm = evm.with_inspector(insp);
+    evm.set_tx(TxEnv {
+        caller,
+        gas_limit: 1_000_000,
+        kind: TransactTo::Call(addr),
+        nonce: 1,
+        ..Default::default()
+    });
+    let res = evm.inspect_replay().unwrap();
+    assert!(res.result.is_success(), "{res:#?}");
+
+    let insp = evm.into_inspector();
+    // A limit far below the 2000-byte contract code, but above the caller-only pruned diff.
+    let (frame, size) = insp
+        .with_transaction_gas_used(res.result.gas_used())
+        .geth_builder()
+        .geth_prestate_traces_with_size_limit(&res, &prestate_config, db, Some(1024))
+        .expect("a small pruned diff must not be rejected for the code it merely touched");
+
+    assert!(
+        size <= 1024,
+        "charged size {size} must reflect the pruned diff, not the pre-prune state"
+    );
+    match frame {
+        PreStateFrame::Diff(diff) => {
+            assert!(
+                !diff.pre.contains_key(&addr) && !diff.post.contains_key(&addr),
+                "the unchanged contract must be pruned from both sides of the diff"
+            );
         }
         _ => panic!("Expected Diff mode PreStateFrame"),
     }

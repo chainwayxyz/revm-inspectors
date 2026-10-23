@@ -170,7 +170,6 @@ impl<'a> GethTraceBuilder<'a> {
 
             // selfdestructs are not recorded as individual call traces but are derived from
             // the call trace and are added as additional `CallFrame` objects
-            // becoming the first child of the derived call
             if let Some(selfdestruct) = trace.geth_selfdestruct_call_trace() {
                 call_frames.last_mut().expect("not empty").1.calls.push(selfdestruct);
             }
@@ -180,14 +179,20 @@ impl<'a> GethTraceBuilder<'a> {
         // this will roll up the child frames to their parent; this works because `child idx >
         // parent idx`
         loop {
-            let (idx, call) = call_frames.pop().expect("call frames not empty");
+            let (idx, mut call) = call_frames.pop().expect("call frames not empty");
             let node = &self.nodes[idx];
+
+            // Children are appended as they are popped, which is highest index first, so they end
+            // up in reverse call order behind the selfdestruct frame that was pushed on
+            // construction; reversing here restores the call order and leaves the selfdestruct
+            // last, which is where inserting each child at the front used to leave it.
+            //
+            // Appending and reversing once is what keeps this linear: inserting every child at the
+            // front makes assembling a frame with `n` children `O(n^2)` moves of a `CallFrame`.
+            call.calls.reverse();
+
             if let Some(parent) = node.parent {
-                let parent_frame = &mut call_frames[parent];
-                // we need to ensure that calls are in order they are called: the last child node is
-                // the last call, but since we walk up the tree, we need to always
-                // insert at position 0
-                parent_frame.1.calls.insert(0, call);
+                call_frames[parent].1.calls.push(call);
             } else {
                 debug_assert!(call_frames.is_empty(), "only one root node has no parent");
                 return call;
@@ -223,16 +228,41 @@ impl<'a> GethTraceBuilder<'a> {
     /// * `db` - The database to fetch state pre-transaction execution.
     pub fn geth_prestate_traces<DB: DatabaseRef>(
         &self,
-        ResultAndState { state, .. }: &ResultAndState<impl HaltReasonTr>,
+        result: &ResultAndState<impl HaltReasonTr>,
         prestate_config: &PreStateConfig,
         db: DB,
     ) -> Result<PreStateFrame, DB::Error> {
+        self.geth_prestate_traces_with_size_limit(result, prestate_config, db, None)
+            .map(|(frame, _size)| frame)
+            .map_err(|e| match e {
+                PrestateError::Database(e) => e,
+                // `None` above disables the size check, so this variant is never produced.
+                PrestateError::MaxResponseSize { .. } => unreachable!("no size limit was set"),
+            })
+    }
+
+    /// Like [`Self::geth_prestate_traces`], but bounds the bytes the returned frame may retain and
+    /// reports how many it did retain.
+    ///
+    /// The frame is built from post-execution state after tracing, so a memory budget enforced over
+    /// a tracer's recorded steps does not cover it. When `max_size` is set, building fails with
+    /// [`PrestateError::MaxResponseSize`] once the retained frame would exceed it, keeping the size
+    /// bounded regardless of how many accounts the transaction touched. The returned count (an
+    /// estimate, see `account_state_size`) lets a caller charge the frame against a budget
+    /// shared across a block's transactions, since each call is bounded only against `max_size`.
+    pub fn geth_prestate_traces_with_size_limit<DB: DatabaseRef>(
+        &self,
+        ResultAndState { state, .. }: &ResultAndState<impl HaltReasonTr>,
+        prestate_config: &PreStateConfig,
+        db: DB,
+        max_size: Option<usize>,
+    ) -> Result<(PreStateFrame, usize), PrestateError<DB::Error>> {
         let code_enabled = prestate_config.code_enabled();
         let storage_enabled = prestate_config.storage_enabled();
         if prestate_config.is_diff_mode() {
-            self.geth_prestate_diff_traces(state, db, code_enabled, storage_enabled)
+            self.geth_prestate_diff_traces(state, db, code_enabled, storage_enabled, max_size)
         } else {
-            self.geth_prestate_pre_traces(state, db, code_enabled, storage_enabled)
+            self.geth_prestate_pre_traces(state, db, code_enabled, storage_enabled, max_size)
         }
     }
 
@@ -242,13 +272,15 @@ impl<'a> GethTraceBuilder<'a> {
         db: DB,
         code_enabled: bool,
         storage_enabled: bool,
-    ) -> Result<PreStateFrame, DB::Error> {
+        max_size: Option<usize>,
+    ) -> Result<(PreStateFrame, usize), PrestateError<DB::Error>> {
         let account_diffs = state.iter().map(|(addr, acc)| (*addr, acc));
         let mut prestate = PreStateMode::default();
+        let mut size = 0usize;
 
         // we only want changed accounts for things like balance changes etc
         for (addr, changed_acc) in account_diffs {
-            let db_acc = db.basic_ref(addr)?.unwrap_or_default();
+            let db_acc = db.basic_ref(addr).map_err(PrestateError::Database)?.unwrap_or_default();
             let code = code_enabled.then(|| load_account_code(&db, &db_acc)).flatten();
             let mut acc_state = AccountState::from_account_info(db_acc.nonce, db_acc.balance, code);
 
@@ -259,10 +291,19 @@ impl<'a> GethTraceBuilder<'a> {
                 }
             }
 
+            // Prestate mode retains every account it builds (nothing is pruned), so charge each one
+            // as it is added and abort before the map grows past the budget; the overshoot is
+            // bounded by the one account in flight (its storage and <= 24 KiB of code under
+            // EIP-170).
+            size += account_state_size(&acc_state);
+            if let Some(limit) = max_size.filter(|limit| size > *limit) {
+                return Err(PrestateError::MaxResponseSize { limit });
+            }
+
             prestate.0.insert(addr, acc_state);
         }
 
-        Ok(PreStateFrame::Default(prestate))
+        Ok((PreStateFrame::Default(prestate), size))
     }
 
     fn geth_prestate_diff_traces<DB: DatabaseRef>(
@@ -271,13 +312,14 @@ impl<'a> GethTraceBuilder<'a> {
         db: DB,
         code_enabled: bool,
         storage_enabled: bool,
-    ) -> Result<PreStateFrame, DB::Error> {
+        max_size: Option<usize>,
+    ) -> Result<(PreStateFrame, usize), PrestateError<DB::Error>> {
         let account_diffs = state.iter().map(|(addr, acc)| (*addr, acc));
         let mut state_diff = DiffMode::default();
         let mut account_change_kinds =
             HashMap::with_capacity_and_hasher(account_diffs.len(), Default::default());
         for (addr, changed_acc) in account_diffs {
-            let db_acc = db.basic_ref(addr)?.unwrap_or_default();
+            let db_acc = db.basic_ref(addr).map_err(PrestateError::Database)?.unwrap_or_default();
 
             let pre_code = code_enabled.then(|| load_account_code(&db, &db_acc)).flatten();
 
@@ -334,7 +376,19 @@ impl<'a> GethTraceBuilder<'a> {
         state_diff.retain_changed().remove_zero_storage_values();
 
         self.diff_traces(&mut state_diff.pre, &mut state_diff.post, account_change_kinds);
-        Ok(PreStateFrame::Diff(state_diff))
+
+        // Charge the *retained* diff, measured after pruning. The pre/post maps built above start
+        // as the full touched state, which `retain_changed`/`diff_traces` prune down to only what
+        // actually changed - often to a small or empty response. Charging the pre-prune size would
+        // reject valid small diffs that merely touched many code-heavy accounts. The transient
+        // pre/post built before pruning is bounded by what the transaction's gas could touch.
+        let size = state_diff.pre.values().map(account_state_size).sum::<usize>()
+            + state_diff.post.values().map(account_state_size).sum::<usize>();
+        if let Some(limit) = max_size.filter(|limit| size > *limit) {
+            return Err(PrestateError::MaxResponseSize { limit });
+        }
+
+        Ok((PreStateFrame::Diff(state_diff), size))
     }
 
     /// Returns the difference between the pre and post state of the transaction depending on the
@@ -368,6 +422,38 @@ impl<'a> GethTraceBuilder<'a> {
 
 fn account_was_empty(account: &AccountInfo) -> bool {
     account.balance.is_zero() && account.nonce == 0 && account.code_hash == KECCAK_EMPTY
+}
+
+/// Per-entry overhead a `BTreeMap` adds on top of the key and value bytes: child pointers and
+/// unused slots in the B-tree node. A conservative constant for budgeting, not an exact figure.
+const BTREE_ENTRY_OVERHEAD: usize = 2 * core::mem::size_of::<usize>();
+
+/// Approximate bytes an [`AccountState`] retains in a prestate frame, keyed by its address: the
+/// map entry it occupies (address key plus node overhead), the record itself, its code, and each
+/// storage slot (key + value plus node overhead). A deliberate over-estimate for budgeting, not an
+/// exact heap measurement; code dominates, up to 24 KiB per account under EIP-170.
+fn account_state_size(acc: &AccountState) -> usize {
+    core::mem::size_of::<Address>()
+        + BTREE_ENTRY_OVERHEAD
+        + core::mem::size_of::<AccountState>()
+        + acc.code.as_ref().map_or(0, |code| code.len())
+        + acc.storage.len() * (2 * core::mem::size_of::<B256>() + BTREE_ENTRY_OVERHEAD)
+}
+
+/// Error returned while building a geth prestate trace under a response size budget. A mux frame
+/// also returns it when its flat-call sub-trace exceeds the budget.
+#[derive(Debug, thiserror::Error)]
+pub enum PrestateError<E> {
+    /// A database error occurred while fetching pre-transaction state.
+    #[error(transparent)]
+    Database(E),
+    /// Building the response would retain more than `limit` bytes; building was aborted before
+    /// the full response was materialized.
+    #[error("prestate response exceeded the memory limit of {limit} bytes")]
+    MaxResponseSize {
+        /// The configured byte budget that was exceeded.
+        limit: usize,
+    },
 }
 
 #[cfg(test)]
@@ -404,8 +490,8 @@ mod tests {
         );
 
         let builder = GethTraceBuilder::new(Vec::new());
-        let frame =
-            builder.geth_prestate_diff_traces(&state, db, false, false).expect("diff frame");
+        let (frame, _size) =
+            builder.geth_prestate_diff_traces(&state, db, false, false, None).expect("diff frame");
 
         match frame {
             PreStateFrame::Diff(diff) => {
