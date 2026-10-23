@@ -25,6 +25,16 @@ pub struct ParityTraceBuilder {
     nodes: Vec<CallTraceNode>,
 }
 
+/// Error returned by
+/// [`ParityTraceBuilder::try_into_localized_transaction_traces_with_size_limit`] when the flat-call
+/// response would retain more than the configured number of `traceAddress` bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("flat call trace response exceeded the memory limit of {limit} bytes")]
+pub struct FlatCallMaxResponseSizeError {
+    /// The configured byte budget that was exceeded.
+    pub limit: usize,
+}
+
 impl ParityTraceBuilder {
     /// Returns a new instance of the builder
     pub fn new(
@@ -67,11 +77,25 @@ impl ParityTraceBuilder {
     ///
     /// CAUTION: This also includes precompiles, which have an empty trace address.
     fn trace_addresses(&self) -> Vec<Vec<usize>> {
+        // resolving a node's position among its siblings by scanning `children` would make this
+        // quadratic in the number of siblings, so index it once up front
+        let index_in_parent = self.index_in_parent();
         let mut all_addresses = Vec::with_capacity(self.nodes.len());
         for idx in 0..self.nodes.len() {
-            all_addresses.push(self.trace_address(idx));
+            all_addresses.push(self.trace_address(idx, &index_in_parent));
         }
         all_addresses
+    }
+
+    /// Maps every node's index in the arena to its position in its parent's `children`.
+    fn index_in_parent(&self) -> Vec<usize> {
+        let mut index_in_parent = vec![0; self.nodes.len()];
+        for node in &self.nodes {
+            for (position, child) in node.children.iter().enumerate() {
+                index_in_parent[*child] = position;
+            }
+        }
+        index_in_parent
     }
 
     /// Returns the `traceAddress` of the node in the arena
@@ -84,7 +108,9 @@ impl ParityTraceBuilder {
     /// if the `idx` does not belong to a node
     ///
     /// Note: if the call node of `idx` is a precompile, the returned trace address will be empty.
-    fn trace_address(&self, idx: usize) -> Vec<usize> {
+    ///
+    /// `index_in_parent` is the table built by [Self::index_in_parent].
+    fn trace_address(&self, idx: usize, index_in_parent: &[usize]) -> Vec<usize> {
         if idx == 0 {
             // root call has empty traceAddress
             return vec![];
@@ -95,16 +121,8 @@ impl ParityTraceBuilder {
             return graph;
         }
         while let Some(parent) = node.parent {
-            // the index of the child call in the arena
-            let child_idx = node.idx;
+            graph.push(index_in_parent[node.idx]);
             node = &self.nodes[parent];
-            // find the index of the child call in the parent node
-            let call_idx = node
-                .children
-                .iter()
-                .position(|child| *child == child_idx)
-                .expect("non precompile child call exists in parent");
-            graph.push(call_idx);
         }
         graph.reverse();
         graph
@@ -140,6 +158,58 @@ impl ParityTraceBuilder {
         info: TransactionInfo,
     ) -> Vec<LocalizedTransactionTrace> {
         self.into_localized_transaction_traces_iter(info).collect()
+    }
+
+    /// Bytes of `traceAddress` payload the flat-call output would retain.
+    ///
+    /// The flat-call output stores one `traceAddress` vector per emitted trace whose length equals
+    /// that trace's depth, so the retained total is `size_of::<usize>() * Σ(depth)` across all
+    /// emitted traces (one per non-precompile node, plus one extra per selfdestruct). This walks
+    /// the arena without allocating the vectors so a caller can bound or charge the payload
+    /// before building it.
+    fn flat_trace_address_retained_bytes(&self) -> usize {
+        if self.nodes.is_empty() {
+            return 0;
+        }
+        // trace_address length == arena depth (root is 0). Nodes are stored parent-before-child, so
+        // one forward pass resolves every depth.
+        let mut depth = vec![0usize; self.nodes.len()];
+        let mut total_len = 0usize;
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if let Some(parent) = node.parent {
+                depth[idx] = depth.get(parent).copied().unwrap_or(0).saturating_add(1);
+            }
+            if node.is_precompile() {
+                // filtered out of the flat-call output
+                continue;
+            }
+            total_len = total_len.saturating_add(depth[idx]);
+            if node.is_selfdestruct() {
+                // emits an additional trace whose address is this node's plus one element
+                total_len = total_len.saturating_add(depth[idx].saturating_add(1));
+            }
+        }
+        total_len.saturating_mul(core::mem::size_of::<usize>())
+    }
+
+    /// Like [`Self::into_localized_transaction_traces`], but first rejects the trace if the
+    /// `traceAddress` payload it would retain exceeds `max_size` bytes, and otherwise returns that
+    /// payload size alongside the traces so a caller sharing a budget across a block can charge it.
+    /// `None` disables the limit.
+    ///
+    /// The payload is the `traceAddress` vectors, `size_of::<usize>()` bytes per element: one
+    /// vector per emitted trace whose length is that trace's depth. It is measured without
+    /// allocating the vectors.
+    pub fn try_into_localized_transaction_traces_with_size_limit(
+        self,
+        info: TransactionInfo,
+        max_size: Option<usize>,
+    ) -> Result<(Vec<LocalizedTransactionTrace>, usize), FlatCallMaxResponseSizeError> {
+        let size = self.flat_trace_address_retained_bytes();
+        if let Some(limit) = max_size.filter(|limit| size > *limit) {
+            return Err(FlatCallMaxResponseSizeError { limit });
+        }
+        Ok((self.into_localized_transaction_traces(info), size))
     }
 
     /// Consumes the inspector and returns the trace results according to the configured trace
@@ -239,9 +309,11 @@ impl ParityTraceBuilder {
         let mut traces = Vec::with_capacity(self.nodes.len());
         // Boolean marker to track if sorting for selfdestruct is needed
         let mut sorting_selfdestruct = false;
+        // see `trace_addresses`: without this the loop below is quadratic in sibling count
+        let index_in_parent = self.index_in_parent();
 
         for node in self.iter_traceable_nodes() {
-            let trace_address = self.trace_address(node.idx);
+            let trace_address = self.trace_address(node.idx, &index_in_parent);
             let trace = node.parity_transaction_trace(trace_address);
             traces.push(trace);
 

@@ -1,6 +1,6 @@
 //! Builtin functions
 
-use alloc::{format, string::ToString, vec::Vec};
+use alloc::{borrow::Cow, format, string::ToString, vec::Vec};
 use alloy_primitives::{hex, map::HashSet, Address, FixedBytes, B256, U256};
 use boa_engine::{
     builtins::{array_buffer::ArrayBuffer, typed_array::TypedArray},
@@ -85,6 +85,7 @@ pub(crate) fn register_builtins(ctx: &mut Context) -> JsResult<()> {
         3,
         NativeFunction::from_fn_ptr(to_contract2),
     )?;
+    ctx.register_global_callable(js_string!("slice"), 3, NativeFunction::from_fn_ptr(slice))?;
 
     Ok(())
 }
@@ -282,16 +283,46 @@ pub(crate) fn to_hex(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
 /// Decodes a hex decoded js-string
 fn hex_decode_js_string(js_string: &JsString) -> JsResult<Vec<u8>> {
     match js_string.to_std_string() {
-        Ok(s) => match hex::decode(s.as_str()) {
-            Ok(data) => Ok(data),
-            Err(err) => Err(JsError::from_native(
-                JsNativeError::error().with_message(format!("invalid hex string {s}: {err}",)),
-            )),
-        },
+        Ok(s) => {
+            // hex decoding strings is pretty relaxed in geth reference implementation, which allows uneven hex values <https://github.com/ethereum/go-ethereum/blob/355228b011ef9a85ebc0f21e7196f892038d49f0/common/bytes.go#L33-L35>
+            // <https://github.com/paradigmxyz/reth/issues/16289>
+            let mut s = Cow::Borrowed(s.strip_prefix("0x").unwrap_or(s.as_str()));
+            if s.as_ref().len() % 2 == 1 {
+                s = Cow::Owned(format!("0{s}"));
+            }
+
+            match hex::decode(s.as_ref()) {
+                Ok(data) => Ok(data),
+                Err(err) => Err(JsError::from_native(
+                    JsNativeError::error()
+                        .with_message(format!("invalid hex string: \"{s}\": {err}",)),
+                )),
+            }
+        }
         Err(err) => Err(JsError::from_native(
             JsNativeError::error()
                 .with_message(format!("invalid utf8 string {js_string:?}: {err}",)),
         )),
+    }
+}
+
+/// Returns a slice of the given value.
+pub(crate) fn slice(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let val = args.get_or_undefined(0).clone();
+
+    let buf = bytes_from_value(val, ctx)?;
+    let start = args.get_or_undefined(1).to_numeric_number(ctx)? as usize;
+    let end = args.get_or_undefined(2).to_numeric_number(ctx)? as usize;
+
+    if start > end || end > buf.len() {
+        Err(JsError::from_native(JsNativeError::error().with_message(format!(
+            "Tracer accessed out of bound memory: available {}, start {}, end {}",
+            buf.len(),
+            start,
+            end
+        ))))
+    } else {
+        to_uint8_array_value(buf[start..end].iter().copied(), ctx)
     }
 }
 
@@ -377,6 +408,18 @@ mod tests {
         assert_eq!(
             result.to_string(&mut ctx).unwrap().to_std_string().unwrap(),
             "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,222,173,190,239"
+        );
+    }
+
+    #[test]
+    fn test_to_word_digit_string() {
+        let mut ctx = Context::default();
+        let value = JsValue::from(js_string!("1"));
+        let result = to_word(&JsValue::undefined(), &[value], &mut ctx).unwrap();
+        assert_eq!(as_length(&result), 32);
+        assert_eq!(
+            result.to_string(&mut ctx).unwrap().to_std_string().unwrap(),
+            "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1"
         );
     }
 
